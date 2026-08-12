@@ -1,0 +1,230 @@
+---
+title: "Which Customers Should We Prioritize for a Retention Campaign?"
+author: "Nourhan Ghanima"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    df_print: kable
+subtitle: RFM Segmentation & Cohort Retention Analysis — Online Retail II
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 8, fig.height = 5)
+library(tidyverse)
+library(readxl)
+library(lubridate)
+library(scales)
+library(knitr)
+```
+
+## The question
+
+Two questions drive this analysis: **which customer segments should the business prioritize for a
+retention campaign, and where are we losing people?**
+
+The data is transaction-level sales from a UK-based online gift-ware retailer (Online Retail II,
+UCI Machine Learning Repository), covering December 2009 to December 2011. The approach: build an
+RFM (Recency, Frequency, Monetary) profile for every customer, group customers into segments based on
+that profile, then track monthly cohorts to see how retention actually decays over time — so the
+recommendation at the end is based on both *who* the valuable-but-at-risk customers are and *when*
+the business tends to lose people.
+
+## Data & cleaning
+
+```{r load-data}
+year1 <- read_xlsx("/Users/nourhanghanima/Downloads/online_retail_II.xlsx", sheet = "Year 2009-2010")
+year2 <- read_xlsx("/Users/nourhanghanima/Downloads/online_retail_II.xlsx", sheet = "Year 2010-2011")
+retail_data <- bind_rows(year1, year2)
+```
+
+Raw data includes cancelled orders, missing customer IDs (guest/unidentified purchases), and a
+handful of zero-price adjustment or bank-charge rows that aren't real product sales. All three are
+excluded, since none of them represent an identifiable customer's actual purchase behavior:
+
+```{r clean-data}
+retail_data <- retail_data |>
+  filter(!is.na(`Customer ID`), Quantity > 0, Price > 0) |>
+  filter(!str_starts(Invoice, "C")) |>                 # cancelled orders
+  mutate(Country = case_match(Country,
+                               "EIRE" ~ "Ireland",
+                               .default = Country)) |>
+  rename(customer_id = `Customer ID`)
+```
+
+## Revenue by country
+
+```{r revenue-by-country}
+revenue_by_country <- retail_data |>
+  mutate(Revenue = Quantity * Price) |>
+  group_by(Country) |>
+  summarize(revenue_country = sum(Revenue)) |>
+  arrange(desc(revenue_country))
+
+uk_share <- revenue_by_country$revenue_country[revenue_by_country$Country == "United Kingdom"] /
+  sum(revenue_by_country$revenue_country)
+```
+
+```{r revenue-chart}
+revenue_by_country |>
+  slice_max(revenue_country, n = 10) |>
+  ggplot(aes(x = reorder(Country, revenue_country), y = revenue_country)) +
+  geom_col(fill = "#2C5F8A") +
+  coord_flip() +
+  scale_y_continuous(labels = scales::comma) +
+  labs(x = NULL, y = "Revenue (£)", title = "Top 10 Countries by Revenue")
+```
+
+The UK accounts for `r percent(uk_share, accuracy = 0.1)` of total revenue — the business is
+heavily concentrated in its home market, with Ireland, the Netherlands, and Germany a distant
+second tier.
+
+## Building customer segments (RFM)
+
+For every customer: **Recency** (days since their last order, relative to the day after the last
+date in the dataset), **Frequency** (count of distinct orders), and **Monetary** (total revenue).
+
+```{r rfm}
+snapshot_date <- max(retail_data$InvoiceDate, na.rm = TRUE) + days(1)
+
+rfm <- retail_data |>
+  mutate(revenue = Quantity * Price) |>
+  group_by(customer_id) |>
+  summarize(
+    frequency = n_distinct(Invoice),
+    monetary  = sum(revenue),
+    recency   = as.numeric(snapshot_date - max(InvoiceDate), units = "days")
+  )
+```
+
+Each measure is scored 1-5 by quintile (relative to the rest of the customer base, not a fixed
+threshold), then combined into a segment label:
+
+```{r rfm-scoring}
+rfm <- rfm |>
+  mutate(
+    r_score = ntile(desc(recency), 5),
+    f_score = ntile(frequency, 5),
+    m_score = ntile(monetary, 5),
+    segment = case_when(
+      r_score >= 4 & f_score >= 4 & m_score >= 4 ~ "Long time regular",
+      r_score >= 3 & f_score >= 3                ~ "Loyal",
+      r_score >= 4 & f_score <= 2                ~ "New Customers",
+      r_score <= 2 & f_score >= 4                ~ "At Risk",
+      r_score <= 2 & f_score <= 2                ~ "Lost",
+      .default = "Other"
+    )
+  )
+
+segment_summary <- rfm |>
+  group_by(segment) |>
+  summarize(
+    customers    = n(),
+    pct_customers = customers / nrow(rfm),
+    revenue      = sum(monetary),
+    pct_revenue  = revenue / sum(rfm$monetary)
+  ) |>
+  arrange(desc(revenue))
+```
+
+```{r segment-table}
+segment_summary |>
+  mutate(pct_customers = percent(pct_customers, accuracy = 0.1),
+         revenue = comma(round(revenue)),
+         pct_revenue = percent(pct_revenue, accuracy = 0.1)) |>
+  kable(col.names = c("Segment", "Customers", "% of Customers", "Revenue (£)", "% of Revenue"))
+```
+
+```{r segment-chart}
+segment_summary |>
+  ggplot(aes(x = reorder(segment, revenue), y = revenue, fill = segment)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  scale_y_continuous(labels = scales::comma) +
+  scale_fill_brewer(palette = "Blues", direction = -1) +
+  labs(x = NULL, y = "Revenue (£)", title = "Revenue by Customer Segment")
+```
+
+The concentration is stark: **"Long time regular" customers are roughly a fifth of the customer
+base but generate the large majority of revenue** — a classic Pareto pattern. "At Risk" customers
+are a small group, but they're small because they *used to* buy frequently and have gone quiet —
+which is exactly the group a retention campaign should target, since they're proven high-value
+customers showing early signs of churn, not low-value customers who were never going to be worth
+the outreach.
+
+## Cohort retention — where are we losing people?
+
+Each customer is assigned a cohort (the month of their first purchase). For every cohort, this
+tracks what percentage of those customers were still buying in each subsequent month.
+
+```{r cohorts}
+cohort_data <- retail_data |>
+  group_by(customer_id) |>
+  arrange(InvoiceDate, .by_group = TRUE) |>
+  slice_head(n = 1) |>
+  ungroup() |>
+  mutate(cohort_month = floor_date(InvoiceDate, "month")) |>
+  select(customer_id, cohort_month)
+
+retail_data <- retail_data |>
+  left_join(cohort_data, by = "customer_id") |>
+  mutate(
+    order_month  = floor_date(InvoiceDate, "month"),
+    cohort_index = (year(order_month) - year(cohort_month)) * 12 +
+                   (month(order_month) - month(cohort_month))
+  )
+
+cohort_counts <- retail_data |>
+  distinct(customer_id, cohort_month, cohort_index) |>
+  count(cohort_month, cohort_index, name = "n_customers")
+
+cohort_sizes <- cohort_counts |>
+  filter(cohort_index == 0) |>
+  select(cohort_month, cohort_size = n_customers)
+
+cohort_retention <- cohort_counts |>
+  left_join(cohort_sizes, by = "cohort_month") |>
+  mutate(retention = n_customers / cohort_size)
+
+month1_retention <- sum(cohort_retention$n_customers[cohort_retention$cohort_index == 1]) /
+  sum(cohort_retention$n_customers[cohort_retention$cohort_index == 0])
+```
+
+```{r cohort-heatmap, fig.height=7}
+cohort_retention |>
+  ggplot(aes(x = cohort_index, y = factor(cohort_month), fill = retention)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient(low = "white", high = "#2C5F8A", labels = percent) +
+  labs(
+    x = "Months Since First Purchase",
+    y = "Cohort (First Purchase Month)",
+    fill = "Retention",
+    title = "Customer Retention by Monthly Cohort"
+  ) +
+  theme_minimal()
+```
+
+Pooled across all cohorts, only about `r percent(month1_retention, accuracy = 0.1)` of customers
+place a second order within one month of their first purchase. Retention doesn't keep falling off a
+cliff after that — it settles into a smaller, fairly stable core rather than continuing to erode
+sharply month over month. That points to the first month after a customer's initial purchase as the
+highest-leverage window: most of the loss happens early, so that's where a re-engagement nudge
+(follow-up email, second-purchase incentive) would have the most effect per customer reached.
+
+## Recommendation
+
+Two findings, put together, point to the same action: retention spend is best directed at the
+**"At Risk"** segment — customers with a proven history of frequent, high-value purchases whose
+recency has dropped — rather than spread evenly across the base or aimed at "Lost" customers, who
+were low-value even when active. Combined with the cohort finding that most churn happens within the
+first month of a relationship, the same logic should also inform onboarding: a proactive nudge in
+the first 30 days is likely to prevent more churn than a later win-back campaign would recover.
+
+## Data source
+
+Chen, D. (2012). *Online Retail II* [Dataset]. UCI Machine Learning Repository.
+https://doi.org/10.24432/C5CG6D
